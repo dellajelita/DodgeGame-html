@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='utf-8'>
+    <title>Gim Saya</title>
+    <style>
+        body {
+            margin: 0;
+            background: #111111;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+    </style>
+</head>
+<body>
+<canvas id='c' width='480' height='520'></canvas>
+<script>
+    var canvas = document.getElementById('c');
+    var ctx = canvas.getContext('2d');
+    var W = canvas.width;
+    var H = canvas.height;
+
+    // Objek player
+    var player = {
+        x: W/2 - 18,
+        y: H - 70,
+        w: 36,
+        h: 36,
+        speed: 240,
+        color: '#4facfe',
+        invincible: 0,
+    };
+
+    // [BONUS 3] Array untuk menampung posisi ekor player
+    var playerTrail = [];
+
+    var keys = {};
+    var lastTime = 0;
+    var score = 0;
+    var lives = 3;
+    var enemies = [];
+    var spawnTimer = 0;
+
+    // Tambahan baru
+    var enemyCount = 0;
+    var levelTextTimer = 0;
+
+    // Partikel
+    var particles = [];
+
+    // Audio
+    var audioCtx = null;
+
+    // Tambahan game state
+    var gameState = 'splash';
+    var highScore = parseInt(localStorage.getItem('dodgeHS') || '0');
+    var level = 1;
+    var scoreTimer = 0;
+    var spawnRate = 1.2;
+
+    // Kecepatan musuh
+    var enemySpeed = 150;
+
+    // Deklarasikan di luar loop (sejajar dengan variabel lain):
+    var shake = { timer:0, x:0, y:0, _int:6 };
+
+    // Floating Text & Tweening Skor
+    var floatTexts  = [];
+    var displayScore = 0; // Skor yang ditampilkan (di-lerp)
+
+    // ── BINTANG ───────────────────────────────────────────
+    var stars = [];
+
+    // ── SISTEM PAUSE ──────────────────────────────────────
+    var isPaused = false;
+
+    function initGame() {
+
+        score = 0;
+        displayScore = 0; // Reset displayScore saat restart
+        lives = 3;
+        level = 1;
+
+        scoreTimer = 0;
+        spawnTimer = 0;
+        spawnRate = 1.2;
+
+        enemies = [];
+        particles = [];
+        floatTexts = []; // Bersihkan teks lama saat restart
+        playerTrail = []; // [BONUS 3] Bersihkan sisa ekor saat restart
+        isPaused = false; // Reset status pause saat restart
+
+        // Inisialisasi di initGame():
+        stars = [];
+        for (var i = 0; i < 50; i++) {
+          stars.push({ x: Math.random()*W, y: Math.random()*H,
+                       r: Math.random()*1.4+0.3, a: Math.random()*0.6+0.2 });
+        }
+
+        enemyCount = 0;
+        levelTextTimer = 0;
+
+        player.x = W/2 - 18;
+        player.y = H - 70;
+        player.invincible = 0;
+
+        enemySpeed = 150;
+
+        gameState = 'playing';
+    }
+
+    // Collision
+    function isColliding(a, b) {
+        return a.x < b.x + b.w &&
+               a.x + a.w > b.x &&
+               a.y < b.y + b.h &&
+               a.y + a.h > b.y;
+    }
+
+    // Partikel dengan Hambatan Udara
+    function emitP(x, y, color, n) {
+      n = n || 8;
+      
+      // [BONUS 1] Mengubah warna ledakan otomatis berdasarkan tingkatan level
+      var pColor = '#00ffff'; // Level 1: Biru muda cerah (menyesuaikan warna dasar player)
+      if (level === 2) {
+          pColor = '#ff0';   // Level 2: Kuning
+      } else if (level >= 3) {
+          pColor = '#f00';   // Level 3+: Merah
+      }
+
+      for (var i = 0; i < n; i++) {
+        var a = Math.random() * Math.PI * 2;
+        var s = 50 + Math.random() * 100;
+        particles.push({
+          x:x, y:y,
+          vx: Math.cos(a) * s,
+          vy: Math.sin(a) * s,
+          life: 0.55, ml: 0.55,
+          r: 2 + Math.random() * 3,
+          color: pColor, // [BONUS 1] Menggunakan warna yang sudah diseleksi
+        });
+      }
+    }
+
+    function spawnFloat(x, y, text, color) {
+      floatTexts.push({
+        x:x, y:y, text:text,
+        color: color || '#ffd166',
+        life: 0.9, ml: 0.9,
+        vy: -55,
+      });
+    }
+
+    // Sound
+    function beep(freq, dur, type) {
+
+        try {
+
+            if (!audioCtx) {
+                audioCtx = new (
+                    window.AudioContext ||
+                    window.webkitAudioContext
+                )();
+            }
+
+            var o = audioCtx.createOscillator();
+            var g = audioCtx.createGain();
+
+            o.connect(g);
+            g.connect(audioCtx.destination);
+
+            o.frequency.value = freq;
+            o.type = type || 'square';
+
+            g.gain.setValueAtTime(
+                0.15,
+                audioCtx.currentTime
+            );
+
+            g.gain.exponentialRampToValueAtTime(
+                0.001,
+                audioCtx.currentTime + dur
+            );
+
+            o.start();
+            o.stop(audioCtx.currentTime + dur);
+
+        } catch(e) {}
+    }
+
+    function sfxHit() {
+        beep(120, 0.15, 'sawtooth');
+    }
+
+    function sfxLevelUp() {
+
+        beep(660, 0.08, 'square');
+
+        setTimeout(function() {
+            beep(880, 0.12);
+        }, 80);
+    }
+
+    function update(dt) {
+
+        // Jangan update jika tidak bermain atau game sedang di-pause
+        if (gameState !== 'playing' || isPaused) return;
+
+        // Di update(dt) bintang drifting:
+        for (var i = 0; i < stars.length; i++) {
+          stars[i].y += 20 * dt;
+          if (stars[i].y > H)
+          stars[i].y = -2;
+        }
+
+        // Lerp displayScore ke score asli
+        displayScore += (score - displayScore) * Math.min(1, dt * 6);
+
+        // Update float texts:
+        for (var i = floatTexts.length-1; i >= 0; i--) {
+          var f = floatTexts[i];
+          f.y += f.vy * dt;
+          f.life -= dt;
+          if (f.life <= 0) floatTexts.splice(i, 1);
+        }
+
+        // Di update(dt) — update shake setiap frame:
+        if (shake.timer > 0) {
+          shake.timer -= dt;
+          shake.x = (Math.random() - 0.5) * shake._int;
+          shake.y = (Math.random() - 0.5) * shake._int;
+        } else { shake.x = 0; shake.y = 0; }
+
+        // Gerak player
+        if (keys['ArrowLeft'] || keys['a']) {
+            player.x -= player.speed * dt;
+        }
+
+        if (keys['ArrowRight'] || keys['d']) {
+            player.x += player.speed * dt;
+        }
+
+        if (keys['ArrowUp'] || keys['w']) {
+            player.y -= player.speed * dt;
+        }
+
+        if (keys['ArrowDown'] || keys['s']) {
+            player.y += player.speed * dt;
+        }
+
+        // Batas canvas
+        player.x = Math.max(0, Math.min(W - player.w, player.x));
+        player.y = Math.max(0, Math.min(H - player.h, player.y));
+
+        // [BONUS 3] Mencatat posisi koordinat player untuk menghasilkan jejak ekor
+        playerTrail.push({ x: player.x, y: player.y });
+        if (playerTrail.length > 5) {
+            playerTrail.shift(); // Batasi panjang array maksimal hanya 5 ekor saja
+        }
+
+        // Spawn musuh
+        spawnTimer += dt;
+
+        if (spawnTimer >= spawnRate) {
+
+            spawnTimer -= spawnRate;
+
+            enemyCount++;
+
+            // Musuh elite
+            if (enemyCount % 10 === 0) {
+
+                enemies.push({
+                    x: Math.random() * (W - 50),
+                    y: -50,
+                    w: 50,
+                    h: 50,
+                    speed: enemySpeed + 40,
+                    color: '#ff00ff',
+                    elite: true,
+                });
+
+            } else {
+
+                // Musuh biasa
+                enemies.push({
+                    x: Math.random() * (W - 30),
+                    y: -30,
+                    w: 30,
+                    h: 30,
+                    speed: enemySpeed,
+                    color: '#ff0000',
+                    elite: false,
+                });
+            }
+        }
+
+        // Update musuh
+        for (var i = enemies.length - 1; i >= 0; i--) {
+
+            enemies[i].y += enemies[i].speed * dt;
+
+            // Hapus jika keluar layar
+            if (enemies[i].y > H + 30) {
+                enemies.splice(i, 1);
+                continue;
+            }
+
+            // Collision
+            if (player.invincible <= 0 &&
+                isColliding(player, enemies[i])) {
+
+                // Saat player terkena musuh — trigger shake:
+                shake.timer = 0.25;
+                shake._int  = 7;
+
+                // Gunakan di saat yang tepat:
+                spawnFloat(player.x, player.y, '-1 HP', '#ff6b6b');    // Kena
+
+                emitP(
+                    player.x + player.w / 2,
+                    player.y + player.h / 2,
+                    '#ff6b6b'
+                );
+
+                sfxHit();
+
+                enemies.splice(i, 1);
+
+                lives--;
+
+                player.invincible = 1.5;
+
+                // Game Over
+                if (lives <= 0) {
+
+                    gameState = 'gameover';
+
+                    // Simpan high score baru
+                    if (Math.floor(score) > highScore) {
+
+                        highScore = Math.floor(score);
+
+                        localStorage.setItem(
+                            'dodgeHS',
+                            highScore
+                        );
+                    }
+                }
+            }
+        }
+
+        // Timer invincible
+        if (player.invincible > 0) {
+            player.invincible -= dt;
+        }
+
+        // Timer animasi level up
+        if (levelTextTimer > 0) {
+            levelTextTimer -= dt;
+        }
+
+        // Di update(dt) — update dan hapus partikel melambat karena friction:
+        for (var i = particles.length-1; i >= 0; i--) {
+          var p = particles[i];
+          p.x += p.vx * dt; p.y += p.vy * dt;
+          p.vx *= 0.94; p.vy *= 0.94; // FRICTION (hambatan udara)
+          p.life -= dt;
+          if (p.life <= 0) particles.splice(i, 1);
+        }
+
+        // Tambah skor
+        score += dt * 10;
+
+        // Level naik
+        var newLevel = Math.floor(score / 100) + 1;
+
+        if (newLevel > level) {
+
+            level = newLevel;
+
+            levelTextTimer = 1.5;
+
+            // Gunakan di saat yang tepat:
+            spawnFloat(W/2, H/2, 'LEVEL UP!', '#ffd166');           // Naik level
+
+            sfxLevelUp();
+        }
+
+        // Musuh makin cepat
+        enemySpeed = 150 + (level - 1) * 30;
+
+        // Spawn makin cepat
+        spawnRate = Math.max(0.4, 1.2 - (level - 1) * 0.1);
+    }
+
+    function render() {
+
+        // Background
+        ctx.fillStyle = '#0b0c10';
+        ctx.fillRect(0, 0, W, H);
+
+        // Di render() (PERTAMA sebelum semua objek):
+        for (var i = 0; i < stars.length; i++) {
+          ctx.globalAlpha = stars[i].a;
+          ctx.fillStyle = '#fff';
+          ctx.beginPath();
+          ctx.arc(stars[i].x, stars[i].y, stars[i].r, 0, Math.PI*2); ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+
+        // Splash screen
+        if (gameState === 'splash') {
+
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 28px Arial';
+            ctx.textAlign = 'center';
+
+            ctx.fillText('DODGE GAME', W/2, H/2 - 20);
+
+            ctx.font = '18px Arial';
+
+            ctx.fillText('Tekan ENTER untuk mulai', W/2, H/2 + 20);
+
+            return;
+        }
+
+        // Di render() — wrap gameplay dengan save/translate/restore:
+        ctx.save();
+        ctx.translate(shake.x, shake.y);
+
+        // Di render() — gambar partikel (sebelum objek lain):
+        for (var i = 0; i < particles.length; i++) {
+          var p = particles[i];
+          ctx.globalAlpha = p.life / p.ml; // Fade out
+          ctx.fillStyle = p.color; // [BONUS 1] Mewarnai partikel berdasarkan data object levelnya
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1; // WAJIB reset!
+
+        // Gambar Floating Texts di dalam gameplay (ikut kena efek shake layar)
+        ctx.font = 'bold 16px Arial';
+        ctx.textAlign = 'center';
+        for (var i = 0; i < floatTexts.length; i++) {
+          var f = floatTexts[i];
+          ctx.globalAlpha = f.life / f.ml; // Efek memudar
+          ctx.fillStyle = f.color;
+          ctx.fillText(f.text, f.x, f.y);
+        }
+        ctx.globalAlpha = 1;
+
+        // [BONUS 3] Menggambar efek trail bayangan di belakang player (Makin lama makin transparan)
+        for (var i = 0; i < playerTrail.length; i++) {
+            ctx.fillStyle = 'rgba(0, 150, 255, ' + ((i + 1) * 0.12) + ')'; 
+            ctx.fillRect(playerTrail[i].x, playerTrail[i].y, player.w, player.h);
+        }
+
+        // Glow player (biru):
+        ctx.shadowBlur  = 12;
+        ctx.shadowColor = '#4facfe';
+        ctx.fillStyle   = player.color;
+        ctx.fillRect(player.x, player.y, player.w, player.h);
+        ctx.shadowBlur  = 0;
+
+        // Musuh
+        for (var i = 0; i < enemies.length; i++) {
+            var enemy = enemies[i];
+
+            // Glow musuh (menyesuaikan warna asli musuh: merah/elite):
+            ctx.shadowBlur  = 10;
+            ctx.shadowColor = enemy.color === '#ff00ff' ? '#ff00ff' : '#ff4444';
+            ctx.fillStyle   = enemy.color;
+            ctx.fillRect(enemy.x, enemy.y, enemy.w, enemy.h);
+            ctx.shadowBlur  = 0; // MATIKAN setelah draw!
+        }
+
+        ctx.restore();
+        // HUD SETELAH restore!
+
+        // HUD baru
+        ctx.fillStyle = 'rgba(0,0,0,0.65)';
+        ctx.fillRect(0, 0, W, 70);
+
+        // Skor
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 16px Arial';
+        ctx.textAlign = 'left';
+
+        // Di render HUD: gunakan displayScore, bukan score!
+        ctx.fillText('Skor: ' + Math.floor(displayScore), 14, 32);
+
+        // High Score
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 16px Arial';
+        ctx.textAlign = 'left';
+        ctx.fillText(
+            'High Score: ' + highScore,
+            14,
+            54
+        );
+
+        // Level
+        ctx.fillStyle = '#ffd166';
+        ctx.textAlign = 'center';
+
+        ctx.fillText(
+            'Level ' + level,
+            W / 2,
+            36
+        );
+
+        // Nyawa
+        for (var i = 0; i < lives; i++) {
+
+            ctx.fillStyle = '#ff6b6b';
+
+            ctx.fillRect(
+                W - 14 - (i + 1) * 20,
+                26,
+                16,
+                16
+            );
+        }
+
+        // Progress bar level
+        var prog = (score % 100) / 100;
+
+        ctx.fillStyle = 'rgba(255,255,255,0.1)';
+        ctx.fillRect(0, 66, W, 4);
+
+        ctx.fillStyle = '#ffd166';
+        ctx.fillRect(0, 66, W * prog, 4);
+
+        // Animasi Level Up
+        if (levelTextTimer > 0) {
+
+            ctx.globalAlpha = levelTextTimer / 1.5;
+
+            ctx.fillStyle = '#ffd166';
+            ctx.font = 'bold 42px Arial';
+            ctx.textAlign = 'center';
+
+            ctx.fillText(
+                'LEVEL UP!',
+                W / 2,
+                H / 2 - 80
+            );
+
+            ctx.globalAlpha = 1;
+        }
+
+        // Game over screen
+        if (gameState === 'gameover') {
+
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 32px Arial';
+            ctx.textAlign = 'center';
+
+            ctx.fillText('GAME OVER', W/2, H/2);
+
+            ctx.font = '18px Arial';
+
+            ctx.fillText('Tekan R untuk restart', W/2, H/2 + 40);
+        }
+
+        // Overlay Tampilan layar saat Pause
+        if (isPaused && gameState === 'playing') {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'; 
+            ctx.fillRect(0, 0, W, H);
+
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 32px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('GIM DI-PAUSE', W/2, H/2);
+            
+            ctx.font = '16px Arial';
+            ctx.fillText('Tekan P kembali untuk lanjut', W/2, H/2 + 35);
+        }
+    }
+
+    function loop(ts) {
+
+        var dt = Math.min((ts - lastTime) / 1000, 0.05);
+
+        lastTime = ts;
+
+        update(dt);
+
+        render();
+
+        requestAnimationFrame(loop);
+    }
+
+    // Keyboard
+    document.addEventListener('keydown', function(e) {
+
+        keys[e.key] = true;
+
+        // Pemicu Tombol Pause (P) saat game sedang berjalan
+        if (gameState === 'playing' && (e.key === 'p' || e.key === 'P')) {
+            isPaused = !isPaused;
+        }
+
+        // Mulai game
+        if (gameState === 'splash' && e.key === 'Enter') {
+            initGame();
+        }
+
+        // Restart game
+        if (gameState === 'gameover' &&
+            (e.key === 'r' || e.key === 'R')) {
+
+            initGame();
+        }
+
+        e.preventDefault();
+    });
+
+    document.addEventListener('keyup', function(e) {
+        keys[e.key] = false;
+    });
+
+    // Mulai loop
+    requestAnimationFrame(function(ts) {
+        lastTime = ts;
+        requestAnimationFrame(loop);
+    });
+
+</script>
+</body>
+</html>
